@@ -569,16 +569,44 @@ class WSDLParser {
               }
             }
           }
+          const input = op['wsdl:input'] || op.input;
           return {
             name: op.name,
-            input: op['wsdl:input'] || op.input,
+            input,
             output: op['wsdl:output'] || op.output,
             fault: this.getArray(op['wsdl:fault'] || op.fault),
-            soapAction: soapAction
+            soapAction: soapAction,
+            ...this.parseInputBinding(input)
           };
         })
       });
     }
+  }
+
+  /**
+   * Extract the soap:header and soap:body bindings of an operation input
+   */
+  parseInputBinding(input) {
+    const headers = [];
+    let bodyParts = null;
+    if (!input || typeof input !== 'object') {
+      return { headers, bodyParts };
+    }
+
+    for (const [key, value] of Object.entries(input)) {
+      if (key.endsWith(':header')) {
+        for (const header of this.getArray(value)) {
+          headers.push({ message: header.message, part: header.part });
+        }
+      } else if (key.endsWith(':body')) {
+        // Without a parts attribute the body carries every part of the input message
+        const body = this.getArray(value)[0];
+        if (body && typeof body.parts === 'string') {
+          bodyParts = body.parts.split(/\s+/).filter(Boolean);
+        }
+      }
+    }
+    return { headers, bodyParts };
   }
 
   /**
@@ -1079,31 +1107,24 @@ class XMLSampleGenerator {
   }
 }
 
-const wrapInSOAPEnvelope = (body, namespaceDeclarations = '') => {
+const wrapInSOAPEnvelope = (body, namespaceDeclarations = '', header = '') => {
   const envelopeTag = `${SOAP_ENVELOPE_PREFIX}:Envelope`;
+  const headerTag = `${SOAP_ENVELOPE_PREFIX}:Header`;
   const bodyTag = `${SOAP_ENVELOPE_PREFIX}:Body`;
+  const headerXml = header ? `<${headerTag}>${header}</${headerTag}>` : '';
   return `<${envelopeTag} xmlns:${SOAP_ENVELOPE_PREFIX}="${SOAP_ENVELOPE_NAMESPACE}"${namespaceDeclarations}>`
-    + `<${bodyTag}>${body}</${bodyTag}></${envelopeTag}>`;
+    + `${headerXml}<${bodyTag}>${body}</${bodyTag}></${envelopeTag}>`;
 };
 
+const stripPrefix = (qname) => (typeof qname === 'string' && qname.includes(':') ? qname.split(':')[1] : qname);
+
 /**
- * Generate SOAP envelope with example payload
+ * Generate an XML sample for a message part
  */
-const generateSOAPEnvelope = (operation, wsdlData) => {
-  const inputMessage = operation.input?.message || '';
-  const inputMessageName = typeof inputMessage === 'string' && inputMessage.includes(':') ? inputMessage.split(':')[1] : inputMessage;
-
-  // Find the message definition
-  const message = wsdlData.messages.get(inputMessageName);
-  if (!message || !message.parts || message.parts.length === 0) {
-    return wrapInSOAPEnvelope('<!-- No message parts found -->');
-  }
-
-  const part = message.parts[0];
+const generatePartSample = (part, wsdlData, generator) => {
   const elementName = part.element || part.type || '';
-
   if (!elementName) {
-    return wrapInSOAPEnvelope('<!-- No element found -->');
+    return '<!-- No element found -->';
   }
 
   // Extract element name and its namespace
@@ -1117,11 +1138,56 @@ const generateSOAPEnvelope = (operation, wsdlData) => {
     namespace = '';
   }
 
-  // Generate XML sample and declare the namespaces
-  const generator = new XMLSampleGenerator(wsdlData);
-  const xmlSample = generator.generateSample(name, namespace);
+  return generator.generateSample(name, namespace);
+};
 
-  return wrapInSOAPEnvelope(xmlSample, generator.getNamespaceDeclarations());
+/**
+ * Generate an XML sample for a soap:header binding
+ */
+const generateHeaderSample = (header, wsdlData, generator) => {
+  const message = wsdlData.messages.get(stripPrefix(header.message));
+  const part = message && message.parts.find((messagePart) => messagePart.name === header.part);
+  if (!part) {
+    return `<!-- Header part ${header.part} of message ${header.message} not found -->`;
+  }
+  return generatePartSample(part, wsdlData, generator);
+};
+
+/**
+ * Select the input message parts that go into the SOAP body
+ */
+const getBodyParts = (message, bindingOperation) => {
+  const { headers = [], bodyParts = null } = bindingOperation || {};
+  if (bodyParts) {
+    return message.parts.filter((part) => bodyParts.includes(part.name));
+  }
+
+  // A part already bound to a header is not repeated in the body
+  const headerParts = new Set(
+    headers.filter((header) => stripPrefix(header.message) === message.name).map((header) => header.part)
+  );
+  return message.parts.filter((part) => !headerParts.has(part.name));
+};
+
+/**
+ * Generate SOAP envelope with example payload
+ */
+const generateSOAPEnvelope = (operation, wsdlData, bindingOperation = null) => {
+  const message = wsdlData.messages.get(stripPrefix(operation.input?.message || ''));
+
+  // One generator for header and body, so every namespace is declared on the envelope
+  const generator = new XMLSampleGenerator(wsdlData);
+  const headers = (bindingOperation && bindingOperation.headers) || [];
+  const header = headers.map((binding) => generateHeaderSample(binding, wsdlData, generator)).join('');
+
+  let body;
+  if (!message || !message.parts || message.parts.length === 0) {
+    body = '<!-- No message parts found -->';
+  } else {
+    body = getBodyParts(message, bindingOperation).map((part) => generatePartSample(part, wsdlData, generator)).join('');
+  }
+
+  return wrapInSOAPEnvelope(body, generator.getNamespaceDeclarations(), header);
 };
 
 /**
@@ -1131,7 +1197,7 @@ const transformWSDLOperation = (operation, wsdlData, serviceLocation, index, all
   // Create a temporary object with the name property for duplicate checking
   const tempItem = { name: operation.name };
   const name = addSuffixToDuplicateName(tempItem, index, allOperations);
-  const soapEnvelope = generateSOAPEnvelope(operation, wsdlData);
+  const soapEnvelope = generateSOAPEnvelope(operation, wsdlData, bindingOperation);
 
   // Use soapAction declared on the binding operation if present
   let soapAction = '';

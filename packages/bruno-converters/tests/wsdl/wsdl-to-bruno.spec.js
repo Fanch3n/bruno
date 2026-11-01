@@ -2,7 +2,12 @@ import { describe, it, expect } from '@jest/globals';
 import wsdlToBruno from '../../src/wsdl/wsdl-to-bruno.js';
 import parseXML from '../../src/wsdl/parse-xml.js';
 
-const wsdlWithTypes = (typesBody, { partElement = 'tns:SignRequest' } = {}) => `<?xml version="1.0" encoding="UTF-8"?>
+const wsdlWithTypes = (typesBody, {
+  partElement = 'tns:SignRequest',
+  messages = '',
+  inputMessage = 'tns:SignRequestMessage',
+  inputBinding = '<soap:body use="literal"/>'
+} = {}) => `<?xml version="1.0" encoding="UTF-8"?>
 <wsdl:definitions name="SignService"
   targetNamespace="http://example.com/sign"
   xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/"
@@ -15,16 +20,17 @@ const wsdlWithTypes = (typesBody, { partElement = 'tns:SignRequest' } = {}) => `
   <wsdl:message name="SignRequestMessage">
     <wsdl:part name="parameters" element="${partElement}"/>
   </wsdl:message>
+  ${messages}
   <wsdl:portType name="SignPortType">
     <wsdl:operation name="Sign">
-      <wsdl:input message="tns:SignRequestMessage"/>
+      <wsdl:input message="${inputMessage}"/>
     </wsdl:operation>
   </wsdl:portType>
   <wsdl:binding name="SignBinding" type="tns:SignPortType">
     <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
     <wsdl:operation name="Sign">
       <wsdl:input>
-        <soap:body use="literal"/>
+        ${inputBinding}
       </wsdl:input>
     </wsdl:operation>
   </wsdl:binding>
@@ -575,6 +581,127 @@ describe('wsdl-to-bruno', () => {
       `);
 
       expect(body).toContain('<tns:SignRequest><label>string</label></tns:SignRequest>');
+    });
+  });
+
+  describe('soap headers and body parts', () => {
+    const schema = `
+      <xsd:schema targetNamespace="http://example.com/sign" elementFormDefault="qualified">
+        <xsd:element name="SignRequest" type="xsd:string"/>
+        <xsd:element name="AuthToken" type="xsd:string"/>
+        <xsd:element name="TraceId" type="xsd:int"/>
+      </xsd:schema>
+    `;
+    const headersMessage = `
+      <wsdl:message name="SignHeaders">
+        <wsdl:part name="trace" element="tns:TraceId"/>
+        <wsdl:part name="auth" element="tns:AuthToken"/>
+      </wsdl:message>
+    `;
+    const signWithAuthMessage = `
+      <wsdl:message name="SignWithAuth">
+        <wsdl:part name="parameters" element="tns:SignRequest"/>
+        <wsdl:part name="auth" element="tns:AuthToken"/>
+      </wsdl:message>
+    `;
+    const generateEnvelope = async (options) => requestBodyOf(await wsdlToBruno(wsdlWithTypes(schema, options)));
+
+    it('emits the bound header parts of another message in binding order before the body', async () => {
+      const body = await generateEnvelope({
+        messages: headersMessage,
+        inputBinding: `
+          <soap:body use="literal"/>
+          <soap:header message="tns:SignHeaders" part="auth" use="literal"/>
+          <soap:header message="tns:SignHeaders" part="trace" use="literal"/>
+        `
+      });
+
+      expect(body).toBe(
+        `${SOAP_ENVELOPE_OPEN} xmlns:tns="http://example.com/sign">`
+        + '<soap:Header><tns:AuthToken>string</tns:AuthToken><tns:TraceId>0</tns:TraceId></soap:Header>'
+        + '<soap:Body><tns:SignRequest>string</tns:SignRequest></soap:Body></soap:Envelope>'
+      );
+    });
+
+    it('moves a part of the input message bound to a header out of the body', async () => {
+      const body = await generateEnvelope({
+        messages: signWithAuthMessage,
+        inputMessage: 'tns:SignWithAuth',
+        inputBinding: `
+          <soap:body use="literal"/>
+          <soap:header message="tns:SignWithAuth" part="auth" use="literal"/>
+        `
+      });
+
+      expect(body).toBe(
+        `${SOAP_ENVELOPE_OPEN} xmlns:tns="http://example.com/sign">`
+        + '<soap:Header><tns:AuthToken>string</tns:AuthToken></soap:Header>'
+        + '<soap:Body><tns:SignRequest>string</tns:SignRequest></soap:Body></soap:Envelope>'
+      );
+    });
+
+    it('puts only the parts listed by the soap:body parts attribute into the body', async () => {
+      const body = await generateEnvelope({
+        messages: signWithAuthMessage,
+        inputMessage: 'tns:SignWithAuth',
+        inputBinding: '<soap:body use="literal" parts="auth"/>'
+      });
+
+      expect(body).toBe(
+        `${SOAP_ENVELOPE_OPEN} xmlns:tns="http://example.com/sign">`
+        + '<soap:Body><tns:AuthToken>string</tns:AuthToken></soap:Body></soap:Envelope>'
+      );
+    });
+
+    it('puts every part of the input message into the body when soap:body lists no parts', async () => {
+      const body = await generateEnvelope({
+        messages: signWithAuthMessage,
+        inputMessage: 'tns:SignWithAuth'
+      });
+
+      expect(body).toContain(
+        '<soap:Body><tns:SignRequest>string</tns:SignRequest><tns:AuthToken>string</tns:AuthToken></soap:Body>'
+      );
+    });
+
+    it('emits the headers of an operation whose input message has no parts', async () => {
+      const body = await generateEnvelope({
+        messages: `${headersMessage}<wsdl:message name="EmptyBody"/>`,
+        inputMessage: 'tns:EmptyBody',
+        inputBinding: `
+          <soap:body use="literal"/>
+          <soap:header message="tns:SignHeaders" part="auth" use="literal"/>
+        `
+      });
+
+      expect(body).toBe(
+        `${SOAP_ENVELOPE_OPEN} xmlns:tns="http://example.com/sign">`
+        + '<soap:Header><tns:AuthToken>string</tns:AuthToken></soap:Header>'
+        + '<soap:Body><!-- No message parts found --></soap:Body></soap:Envelope>'
+      );
+    });
+
+    it('marks a header that references an unknown message part', async () => {
+      const body = await generateEnvelope({
+        inputBinding: `
+          <soap:body use="literal"/>
+          <soap:header message="tns:SignHeaders" part="auth" use="literal"/>
+        `
+      });
+
+      expect(body).toContain('<soap:Header><!-- Header part auth of message tns:SignHeaders not found --></soap:Header>');
+    });
+
+    it('reads header bindings declared with the SOAP 1.2 binding namespace', async () => {
+      const body = await generateEnvelope({
+        messages: headersMessage,
+        inputBinding: `
+          <soap12:body xmlns:soap12="http://schemas.xmlsoap.org/wsdl/soap12/" use="literal"/>
+          <soap12:header xmlns:soap12="http://schemas.xmlsoap.org/wsdl/soap12/" message="tns:SignHeaders" part="auth" use="literal"/>
+        `
+      });
+
+      expect(body).toContain('<soap:Header><tns:AuthToken>string</tns:AuthToken></soap:Header>');
     });
   });
 });
